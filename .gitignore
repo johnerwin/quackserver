@@ -13,3 +13,4 @@ venv/
 *.sqlite
 *.db
 .env
+.claude/
