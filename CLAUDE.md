@@ -53,27 +53,34 @@ Read path: concurrent reads under `asyncio.Semaphore` (slot count = `MAX_CONCURR
 - **`request_id` is required on all writes.** Missing request_id returns 400 before any processing.
 - **ProjectionStore.apply() must be idempotent.** The replay path calls it on already-applied commands.
 
-## Current Status (as of 2026-05-05)
+## Current Status (as of 2026-05-07)
 
-Write path is complete and tested (260 tests). Read path is stubbed:
-- **Issue #2**: DuckDB projection — `storage/duckdb_impl.py` needs implementing
-- **Issue #3**: Read endpoints — `GET /dashboard` and `GET /reports/{id}` return 501
-- **Issue #1**: Backpressure metrics — queue occupancy exposure
+All three original issues are resolved, plus a rebuild CLI. 307 tests pass.
 
-Do not implement read endpoints until issue #2 is resolved.
+- **Issue #1** ✅ Backpressure metrics — `queue_pct`, `queue_warning` exposed on `/health`; tested under load in `test_runtime.py::TestBackpressure`
+- **Issue #2** ✅ DuckDB projection — `DuckDBProjectionStore` in `storage/duckdb_impl.py`; tested in `tests/test_duckdb_projection.py`
+- **Issue #3** ✅ Read endpoints — `GET /dashboard`, `GET /reports/events`, `GET /reports/users` all live; tested in `test_app.py::TestDashboard`, `TestReportEvents`, `TestReportUsers`
+
+Key implementation notes for Issue #2/#3:
+- `DuckDBProjectionStore` implements both `ProjectionStore` and `ReadStore`.
+- All DuckDB access (reads and writes) runs on a single `ThreadPoolExecutor(max_workers=1)` to avoid multi-thread access on one connection.
+- `ProjectionStore.initialize()` (no-op default, overridden in DuckDB impl) is called by `Runtime.start()` to pre-warm the connection before the server accepts requests.
+- Read/write eventual consistency is intentional: writes are durable on log fsync; DuckDB projection lags slightly.
 
 ## Test Suite
 
 ```bash
-pytest                        # all 260 tests
-pytest tests/test_chaos.py    # durability contracts (most important)
+pytest                           # all 296 tests
+pytest tests/test_chaos.py       # durability contracts (most important)
 pytest tests/test_projection.py  # idempotency invariants
-pytest tests/test_runtime.py  # state machine
+pytest tests/test_runtime.py     # state machine
+pytest tests/test_duckdb_projection.py  # DuckDB write/read correctness
+pytest tests/test_app.py         # HTTP integration including read endpoints
 ```
 
 The chaos suite (`test_chaos.py`) is the bar for write-path changes: no data loss, no duplicates across failure/restart cycles. If you touch the log, dedup store, worker, or checkpoint, run it explicitly.
 
-`InMemoryProjectionStore` in `core/projection.py` is the strict fake used in tests. It enforces the same invariants as the real DuckDB implementation will — UPSERT for `create_user`, unique-by-request_id for `append_event`, terminal failure for unknown commands.
+`InMemoryProjectionStore` in `core/projection.py` is the strict fake used in most tests. It enforces the same invariants as DuckDB — UPSERT for `create_user`, unique-by-request_id for `append_event`, terminal failure for unknown commands.
 
 ## Resource Limits
 

@@ -34,15 +34,16 @@ import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 
-from quackserver.config import MAX_WRITE_QUEUE_SIZE, WRITE_QUEUE_WARNING_PCT
+from quackserver.config import MAX_CONCURRENT_READS, MAX_WRITE_QUEUE_SIZE, WRITE_QUEUE_WARNING_PCT
 from quackserver.core.checkpoint import ReplayCheckpoint
 from quackserver.core.commands import Command
 from quackserver.core.dedup import DedupStore
 from quackserver.core.health import HealthSnapshot, RuntimeState
 from quackserver.core.log import AppendLogReader, AppendLogWriter
+from quackserver.core.projection import ProjectionStore
+from quackserver.core.read_store import ReadStore
 from quackserver.core.replay import ReplayScanner
 from quackserver.core.structured_log import StructuredLogger, get_logger
-from quackserver.core.projection import ProjectionStore
 from quackserver.core.worker import WriteWorker
 from quackserver.storage.interface import Result
 
@@ -73,13 +74,16 @@ class Runtime:
         dedup_path: Path,
         checkpoint_path: Path,
         projection: ProjectionStore,
+        read_store: ReadStore | None = None,
         queue_size: int = MAX_WRITE_QUEUE_SIZE,
     ) -> None:
         self._log_path = log_path
         self._dedup_path = dedup_path
         self._checkpoint_path = checkpoint_path
         self._projection = projection
+        self._read_store = read_store
         self._queue_max = queue_size
+        self._read_semaphore = asyncio.Semaphore(MAX_CONCURRENT_READS)
 
         # Initialised in start(). None before start() or after stop().
         self._log_writer: AppendLogWriter | None = None
@@ -160,6 +164,7 @@ class Runtime:
                 dedup=self._dedup,
             )
             self._worker_task = asyncio.create_task(self._worker.run())
+            await self._projection.initialize()
 
             _log.info(
                 "runtime_started",
@@ -370,6 +375,47 @@ class Runtime:
     # ------------------------------------------------------------------
     # Observability
     # ------------------------------------------------------------------
+
+    async def execute_read(self, query_fn, timeout_ms: int) -> Result:
+        """Execute a read coroutine with state guard, semaphore, and timeout.
+
+        query_fn: zero-argument async callable returning Result.
+        timeout_ms: wall-clock limit in milliseconds; exceeded -> 504.
+
+        Return value semantics:
+          200  — query succeeded; data in result.data.
+          503  — runtime not running, read store absent, or pool exhausted.
+          504  — query exceeded timeout_ms.
+        """
+        if self._state != RuntimeState.RUNNING:
+            return Result(
+                success=False,
+                status_code=503,
+                error=f"runtime not accepting reads (state: {self._state.name})",
+            )
+        if self._read_store is None:
+            return Result(
+                success=False,
+                status_code=503,
+                error="read store not configured",
+            )
+        if self._read_semaphore.locked():
+            return Result(
+                success=False,
+                status_code=503,
+                error="read pool exhausted — too many concurrent reads",
+            )
+        async with self._read_semaphore:
+            try:
+                return await asyncio.wait_for(
+                    query_fn(), timeout=timeout_ms / 1000
+                )
+            except asyncio.TimeoutError:
+                return Result(
+                    success=False,
+                    status_code=504,
+                    error=f"read query exceeded {timeout_ms}ms timeout",
+                )
 
     def health_snapshot(self) -> HealthSnapshot:
         """Return a point-in-time view of runtime state.

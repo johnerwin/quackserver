@@ -8,9 +8,13 @@ version = "0.1.0"
 description = "Constrained DuckDB application server for solo developers"
 requires-python = ">=3.11"
 dependencies = [
+    "duckdb>=1.0",
     "fastapi>=0.110",
     "uvicorn[standard]>=0.29",
 ]
+
+[project.scripts]
+quackserver = "quackserver.__main__:main"
 
 [project.optional-dependencies]
 dev = [

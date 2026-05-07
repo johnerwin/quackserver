@@ -19,13 +19,24 @@ live DuckDB connections — Phase 4 work.
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from quackserver.config import MAX_PAYLOAD_SIZE_MB
+from quackserver.config import (
+    DASHBOARD_QUERY_TIMEOUT_MS,
+    MAX_PAYLOAD_SIZE_MB,
+    REPORT_MAX_ROWS,
+    REPORT_QUERY_TIMEOUT_MS,
+)
 from quackserver.core.commands import Command
 from quackserver.core.runtime import Runtime
 from quackserver.http.models import (
     AppendEventRequest,
     CreateUserRequest,
+    DashboardResponse,
+    EventsByTypeItem,
+    EventItem,
     HealthResponse,
+    ReportEventsResponse,
+    ReportUsersResponse,
+    UserItem,
     WriteResponse,
 )
 
@@ -94,18 +105,84 @@ async def post_users(request: Request, body: CreateUserRequest) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
-# Read endpoints — stubs until DuckDB projection is implemented (Phase 4)
+# Read endpoints
 # ---------------------------------------------------------------------------
 
+_READ_REPORTS = {"events", "users"}
 
-@router.get("/dashboard")
+
+@router.get("/dashboard", response_model=DashboardResponse)
 async def get_dashboard(request: Request) -> JSONResponse:
-    raise HTTPException(status_code=501, detail="not implemented — DuckDB projection pending")
+    rt = _runtime(request)
+    # _read_store None-check is inside execute_read; lambda is never called if absent.
+    result = await rt.execute_read(
+        lambda: rt._read_store.dashboard(),
+        DASHBOARD_QUERY_TIMEOUT_MS,
+    )
+    if not result.success:
+        raise HTTPException(status_code=result.status_code, detail=result.error)
+    d = result.data
+    body = DashboardResponse(
+        user_count=d["user_count"],
+        event_count=d["event_count"],
+        events_by_type=[
+            EventsByTypeItem(event_type=r["event_type"], count=r["count"])
+            for r in d["events_by_type"]
+        ],
+    )
+    return JSONResponse(status_code=200, content=body.model_dump())
 
 
 @router.get("/reports/{report_id}")
 async def get_report(request: Request, report_id: str) -> JSONResponse:
-    raise HTTPException(status_code=501, detail="not implemented — DuckDB projection pending")
+    if report_id not in _READ_REPORTS:
+        raise HTTPException(
+            status_code=404,
+            detail=f"unknown report '{report_id}'; valid: {sorted(_READ_REPORTS)}",
+        )
+    rt = _runtime(request)
+    if report_id == "events":
+        result = await rt.execute_read(
+            lambda: rt._read_store.events(REPORT_MAX_ROWS),
+            REPORT_QUERY_TIMEOUT_MS,
+        )
+        if not result.success:
+            raise HTTPException(status_code=result.status_code, detail=result.error)
+        d = result.data
+        body = ReportEventsResponse(
+            events=[
+                EventItem(
+                    request_id=e["request_id"],
+                    event_type=e["event_type"],
+                    data=e["data"],
+                    received_at=e["received_at"],
+                )
+                for e in d["events"]
+            ],
+            count=d["count"],
+        )
+        return JSONResponse(status_code=200, content=body.model_dump())
+
+    # report_id == "users"
+    result = await rt.execute_read(
+        lambda: rt._read_store.users(REPORT_MAX_ROWS),
+        REPORT_QUERY_TIMEOUT_MS,
+    )
+    if not result.success:
+        raise HTTPException(status_code=result.status_code, detail=result.error)
+    d = result.data
+    body = ReportUsersResponse(
+        users=[
+            UserItem(
+                user_id=u["user_id"],
+                data=u["data"],
+                created_at=u["created_at"],
+            )
+            for u in d["users"]
+        ],
+        count=d["count"],
+    )
+    return JSONResponse(status_code=200, content=body.model_dump())
 
 
 # ---------------------------------------------------------------------------

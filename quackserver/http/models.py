@@ -84,3 +84,43 @@ class HealthResponse(BaseModel):
     worker_running: bool
     replay_pending: int
     malformed_log_entries: int
+
+
+class EventsByTypeItem(BaseModel):
+    event_type: str
+    count: int
+
+
+class DashboardResponse(BaseModel):
+    """Response for GET /dashboard."""
+
+    user_count: int
+    event_count: int
+    events_by_type: list[EventsByTypeItem]
+
+
+class EventItem(BaseModel):
+    request_id: str
+    event_type: str
+    data: dict[str, Any]
+    received_at: str
+
+
+class UserItem(BaseModel):
+    user_id: str
+    data: dict[str, Any]
+    created_at: str
+
+
+class ReportEventsResponse(BaseModel):
+    """Response for GET /reports/events."""
+
+    events: list[EventItem]
+    count: int
+
+
+class ReportUsersResponse(BaseModel):
+    """Response for GET /reports/users."""
+
+    users: list[UserItem]
+    count: int

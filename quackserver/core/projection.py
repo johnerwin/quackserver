@@ -33,6 +33,14 @@ from quackserver.storage.interface import Result
 class ProjectionStore(ABC):
     """Minimal contract for applying write commands to derived state."""
 
+    async def initialize(self) -> None:
+        """Called once by the Runtime during startup, before any apply() calls.
+
+        Implementations should open connections, create schemas, and do any
+        other work that would otherwise add latency to the first write.
+        Default is a no-op (suitable for in-memory and test implementations).
+        """
+
     @abstractmethod
     async def apply(self, command: Command) -> Result:
         """Apply one command to the projection.

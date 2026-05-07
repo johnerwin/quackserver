@@ -8,10 +8,13 @@ from pathlib import Path
 
 import pytest
 
+from quackserver.config import WRITE_QUEUE_WARNING_PCT
 from quackserver.core.commands import Command
 from quackserver.core.health import RuntimeState
 from quackserver.core.log import AppendLogWriter
+from quackserver.core.projection import ProjectionStore
 from quackserver.core.runtime import Runtime
+from quackserver.storage.interface import Result
 
 from .conftest import MockProjection
 
@@ -482,3 +485,122 @@ class TestHealthSnapshot:
                 await rt.stop()
 
         asyncio.run(_run())
+
+
+# ---------------------------------------------------------------------------
+# Backpressure — queue pressure contracts (Issue #1)
+# ---------------------------------------------------------------------------
+
+
+def _slow_projection(gate: asyncio.Event) -> ProjectionStore:
+    """ProjectionStore that blocks every apply() until gate is set.
+
+    Used to hold the write worker at a known point so tests can observe
+    queue depth without racing against the drain loop.
+    """
+
+    class _Slow(ProjectionStore):
+        async def apply(self, command: Command) -> Result:
+            await gate.wait()
+            return Result(
+                success=True, status_code=200, request_id=command.request_id
+            )
+
+        async def health(self) -> Result:
+            return Result(success=True, status_code=200)
+
+        async def close(self) -> None:
+            pass
+
+    return _Slow()
+
+
+class TestBackpressure:
+    def test_queue_full_returns_503(self, tmp_path):
+        """Overflowing the write queue returns 503 and error='queue full'."""
+        async def _run():
+            gate = asyncio.Event()
+            # Worker takes item 0, holds it. Items 1-2 fill the queue (maxsize=2).
+            # Item 3 overflows -> 503.
+            rt = _runtime(tmp_path, projection=_slow_projection(gate), queue_size=2)
+            await rt.start()
+            try:
+                for i in range(3):
+                    r = await rt.enqueue(_cmd(f"bp-fill-{i}"))
+                    assert r.success is True
+                overflow = await rt.enqueue(_cmd("bp-overflow"))
+                assert overflow.success is False
+                assert overflow.status_code == 503
+                assert "queue full" in (overflow.error or "").lower()
+            finally:
+                gate.set()
+                await rt.stop()
+
+        asyncio.run(_run())
+
+    def test_queue_depth_nonzero_under_pressure(self, tmp_path):
+        """health_snapshot().queue_depth is non-zero when the worker is blocked."""
+        async def _run():
+            gate = asyncio.Event()
+            rt = _runtime(tmp_path, projection=_slow_projection(gate), queue_size=10)
+            await rt.start()
+            try:
+                for i in range(5):
+                    await rt.enqueue(_cmd(f"bp-d{i}"))
+                # Worker holds 1 item; at least 1 more is in the queue.
+                snap = rt.health_snapshot()
+                assert snap.queue_depth >= 1
+                assert snap.queue_pct > 0.0
+            finally:
+                gate.set()
+                await rt.stop()
+
+        asyncio.run(_run())
+
+    def test_queue_warning_fires_at_threshold(self, tmp_path):
+        """is_queue_warning is True when occupancy >= WRITE_QUEUE_WARNING_PCT."""
+        async def _run():
+            gate = asyncio.Event()
+            queue_size = 10
+            rt = _runtime(
+                tmp_path, projection=_slow_projection(gate), queue_size=queue_size
+            )
+            await rt.start()
+            try:
+                # 9 enqueues: worker takes 1, 8 remain -> 80% of 10.
+                for i in range(9):
+                    await rt.enqueue(_cmd(f"bp-w{i}"))
+                snap = rt.health_snapshot()
+                assert snap.is_queue_warning is True
+                assert snap.queue_pct >= WRITE_QUEUE_WARNING_PCT
+            finally:
+                gate.set()
+                await rt.stop()
+
+        asyncio.run(_run())
+
+    def test_queue_full_entry_written_to_log(self, tmp_path):
+        """A 503 from queue-full still persists the entry to the append log."""
+        log_path = tmp_path / "log.jsonl"
+
+        async def _run():
+            gate = asyncio.Event()
+            rt = Runtime(
+                log_path=log_path,
+                dedup_path=tmp_path / "dedup.db",
+                checkpoint_path=tmp_path / "checkpoint.db",
+                projection=_slow_projection(gate),
+                queue_size=2,
+            )
+            await rt.start()
+            try:
+                for i in range(3):
+                    await rt.enqueue(_cmd(f"bp-{i}"))
+                r = await rt.enqueue(_cmd("bp-log-durability"))
+                assert r.status_code == 503
+            finally:
+                gate.set()
+                await rt.stop()
+
+        asyncio.run(_run())
+        assert "bp-log-durability" in log_path.read_text()
