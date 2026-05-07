@@ -328,16 +328,24 @@ class TestStorageInterface:
 
 class TestDuckdbImplIsolation:
     def test_duckdb_impl_is_the_only_duckdb_importer(self):
-        """Walk every .py file in the package and assert duckdb is only in duckdb_impl.py."""
+        """Walk every .py file in the package and assert duckdb is only in duckdb_impl.py.
+
+        CLI tools in quackserver/cli/ are standalone utilities that necessarily
+        import duckdb directly — they are not part of the server's layered
+        architecture and are explicitly excluded from this constraint.
+        """
+        cli_dir = PACKAGE_ROOT / "cli"
         violations = []
         for py_file in PACKAGE_ROOT.rglob("*.py"):
             if py_file.name == "duckdb_impl.py":
                 continue
+            if py_file.is_relative_to(cli_dir):
+                continue  # CLI tools are standalone; duckdb is allowed there
             imports = _source_imports(py_file)
             if "duckdb" in imports:
                 violations.append(str(py_file.relative_to(PROJECT_ROOT)))
         assert violations == [], (
-            f"duckdb imported outside duckdb_impl.py: {violations}"
+            f"duckdb imported outside duckdb_impl.py (and cli/): {violations}"
         )
 
 

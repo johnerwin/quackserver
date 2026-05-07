@@ -19,11 +19,13 @@ Write error classification:
   malformed payload   -> retryable=False (terminal; retrying cannot help)
   unknown command     -> retryable=False (terminal)
 
-Read connections:
-  Each read query opens its own read-only duckdb connection and closes it
-  before returning. This keeps reads independent of the write connection
-  and avoids connection pool complexity. Concurrency is bounded upstream
-  by Runtime's asyncio.Semaphore(MAX_CONCURRENT_READS).
+Connection model (spec §11):
+  Write path: single connection on a 1-thread executor. Serialises all mutations.
+  Read path: READ_POOL_SIZE connections on a separate executor, one per reader
+  thread (threading.local). DuckDB allows multiple in-process read-write
+  connections to the same file; read_only=True is not used because DuckDB
+  rejects it when a read-write connection is already open in the same process.
+  Concurrent reads and writes are handled by DuckDB's internal WAL.
 
 No duckdb exception escapes this module. All exceptions are caught and
 returned as Result objects.
@@ -33,10 +35,12 @@ import asyncio
 import concurrent.futures
 import functools
 import json
+import threading
 from pathlib import Path
 
 import duckdb
 
+from quackserver.config import READ_POOL_SIZE
 from quackserver.core.commands import Command
 from quackserver.core.projection import ProjectionStore
 from quackserver.core.read_store import ReadStore
@@ -78,9 +82,10 @@ _SCHEMA_SQL = [
 class DuckDBProjectionStore(ProjectionStore, ReadStore):
     """Writes create_user and append_event commands to a DuckDB file.
 
-    Single connection, single thread. All SQL executes on a dedicated
-    ThreadPoolExecutor(max_workers=1) so DuckDB is never accessed from
-    more than one OS thread simultaneously.
+    Two executors, two connection scopes:
+    - _executor (1 thread): exclusive write connection; all mutations run here.
+    - _read_executor (READ_POOL_SIZE threads): each thread holds its own
+      connection via threading.local; read queries run here, isolated from writes.
     """
 
     def __init__(self, db_path: Path) -> None:
@@ -88,7 +93,11 @@ class DuckDBProjectionStore(ProjectionStore, ReadStore):
         self._executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="duckdb-write"
         )
+        self._read_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=READ_POOL_SIZE, thread_name_prefix="duckdb-read"
+        )
         self._conn: duckdb.DuckDBPyConnection | None = None
+        self._read_local = threading.local()
 
     # ------------------------------------------------------------------
     # ProjectionStore interface
@@ -123,6 +132,10 @@ class DuckDBProjectionStore(ProjectionStore, ReadStore):
 
     async def close(self) -> None:
         loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            self._read_executor, self._close_read_connections_sync
+        )
+        self._read_executor.shutdown(wait=True)
         await loop.run_in_executor(self._executor, self._close_sync)
         self._executor.shutdown(wait=True)
 
@@ -135,20 +148,20 @@ class DuckDBProjectionStore(ProjectionStore, ReadStore):
     async def dashboard(self) -> Result:
         await self._ensure_open()
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self._executor, self._dashboard_sync)
+        return await loop.run_in_executor(self._read_executor, self._dashboard_sync)
 
     async def events(self, limit: int) -> Result:
         await self._ensure_open()
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
-            self._executor, functools.partial(self._events_sync, limit)
+            self._read_executor, functools.partial(self._events_sync, limit)
         )
 
     async def users(self, limit: int) -> Result:
         await self._ensure_open()
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
-            self._executor, functools.partial(self._users_sync, limit)
+            self._read_executor, functools.partial(self._users_sync, limit)
         )
 
     # ------------------------------------------------------------------
@@ -304,6 +317,22 @@ class DuckDBProjectionStore(ProjectionStore, ReadStore):
                 retryable=True,
             )
 
+    def _get_read_conn_sync(self) -> duckdb.DuckDBPyConnection:
+        """Return this thread's read connection, opening it lazily on first use."""
+        if not hasattr(self._read_local, "conn") or self._read_local.conn is None:
+            self._read_local.conn = duckdb.connect(str(self._db_path))
+        return self._read_local.conn
+
+    def _close_read_connections_sync(self) -> None:
+        """Close this thread's read connection. Called on each reader thread at shutdown."""
+        conn = getattr(self._read_local, "conn", None)
+        if conn is not None:
+            try:
+                conn.close()
+            except duckdb.Error as exc:
+                _log.warning("duckdb_read_close_error", error=str(exc))
+            self._read_local.conn = None
+
     def _close_sync(self) -> None:
         if self._conn is not None:
             try:
@@ -313,10 +342,11 @@ class DuckDBProjectionStore(ProjectionStore, ReadStore):
             self._conn = None
 
     def _dashboard_sync(self) -> Result:
+        conn = self._get_read_conn_sync()
         try:
-            user_count = self._conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-            event_count = self._conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
-            by_type = self._conn.execute(
+            user_count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+            event_count = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+            by_type = conn.execute(
                 "SELECT event_type, COUNT(*) AS cnt"
                 " FROM events GROUP BY event_type ORDER BY cnt DESC"
             ).fetchall()
@@ -341,8 +371,9 @@ class DuckDBProjectionStore(ProjectionStore, ReadStore):
             )
 
     def _events_sync(self, limit: int) -> Result:
+        conn = self._get_read_conn_sync()
         try:
-            rows = self._conn.execute(
+            rows = conn.execute(
                 "SELECT request_id, event_type, data, received_at"
                 " FROM events ORDER BY received_at DESC LIMIT ?",
                 [limit],
@@ -373,8 +404,9 @@ class DuckDBProjectionStore(ProjectionStore, ReadStore):
             )
 
     def _users_sync(self, limit: int) -> Result:
+        conn = self._get_read_conn_sync()
         try:
-            rows = self._conn.execute(
+            rows = conn.execute(
                 "SELECT user_id, data, created_at FROM users ORDER BY user_id LIMIT ?",
                 [limit],
             ).fetchall()
@@ -406,7 +438,7 @@ class DuckDBProjectionStore(ProjectionStore, ReadStore):
         """Return all projection_metadata key/value pairs."""
         await self._ensure_open()
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self._executor, self._metadata_sync)
+        return await loop.run_in_executor(self._read_executor, self._metadata_sync)
 
     async def record_rebuild(
         self, *, log_path: str, entry_count: int, rebuilt_at: str
@@ -427,8 +459,9 @@ class DuckDBProjectionStore(ProjectionStore, ReadStore):
         )
 
     def _metadata_sync(self) -> Result:
+        conn = self._get_read_conn_sync()
         try:
-            rows = self._conn.execute(
+            rows = conn.execute(
                 "SELECT key, value, updated_at FROM projection_metadata ORDER BY key"
             ).fetchall()
             return Result(

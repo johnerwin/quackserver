@@ -15,6 +15,8 @@ dependencies = [
 
 [project.scripts]
 quackserver = "quackserver.__main__:main"
+duckdb-inspect = "quackserver.cli.inspect:main"
+duckdb-compact = "quackserver.cli.compact:main"
 
 [project.optional-dependencies]
 dev = [

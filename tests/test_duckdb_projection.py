@@ -13,6 +13,7 @@ All async tests use asyncio.run() — no external async test framework needed.
 
 import asyncio
 import json
+import time
 from pathlib import Path
 
 import duckdb
@@ -390,3 +391,116 @@ class TestPersistence:
         assert r.success is True
         rows = _read_rows(db_path, "events")
         assert len(rows) == 1
+
+
+# ---------------------------------------------------------------------------
+# Read/write executor isolation
+# ---------------------------------------------------------------------------
+
+
+class TestReadWriteIsolation:
+    """Read queries run on a separate executor from writes.
+
+    Success criteria from issue #5:
+    - READ_POOL_SIZE constant is actually used (executor has the right worker count)
+    - Concurrent reads do not share the write executor thread
+    - A slow read does not delay concurrent writes
+    """
+
+    def test_read_pool_size_is_used(self, tmp_path):
+        s = DuckDBProjectionStore(tmp_path / "test.duckdb")
+        from quackserver.config import READ_POOL_SIZE
+
+        assert s._read_executor._max_workers == READ_POOL_SIZE
+        asyncio.run(s.close())
+
+    def test_reads_and_writes_run_concurrently(self, tmp_path):
+        """Writes must not be delayed by concurrent reads.
+
+        Seed the DB, then fire a write and a dashboard read simultaneously.
+        Verify the write completes well under its own deadline even while
+        a read is in flight.
+        """
+
+        async def _run():
+            s = _store(tmp_path)
+            # Seed some data so the read has rows to scan
+            for i in range(50):
+                await s.apply(_create_user(f"seed-{i}", f"user-{i}"))
+            await s.apply(_append_event("seed-ev", "page.view"))
+
+            write_times: list[float] = []
+            read_times: list[float] = []
+
+            async def timed_write(n: int) -> None:
+                t0 = time.monotonic()
+                await s.apply(_create_user(f"conc-{n}", f"conc-user-{n}"))
+                write_times.append(time.monotonic() - t0)
+
+            async def timed_read() -> None:
+                t0 = time.monotonic()
+                await s.dashboard()
+                read_times.append(time.monotonic() - t0)
+
+            await asyncio.gather(
+                timed_read(),
+                timed_write(0),
+                timed_write(1),
+                timed_write(2),
+            )
+
+            await s.close()
+            return write_times, read_times
+
+        write_times, read_times = asyncio.run(_run())
+
+        assert len(write_times) == 3
+        assert len(read_times) == 1
+        # Writes must each complete well under MAX_WRITE_TIME_MS (500ms);
+        # if reads were serializing with writes they would inflate this.
+        for wt in write_times:
+            assert wt < 0.4, f"write took {wt*1000:.0f}ms — likely blocked by read"
+
+    def test_reads_use_separate_connections_from_write(self, tmp_path):
+        """Read sync methods must never use self._conn (the write connection)."""
+        import threading
+
+        async def _run():
+            s = _store(tmp_path)
+            await s.apply(_create_user("r1", "alice"))
+
+            read_thread_ids: list[int] = []
+            write_thread_id: int | None = None
+
+            original_dashboard = s._dashboard_sync
+
+            def capturing_dashboard():
+                read_thread_ids.append(threading.get_ident())
+                return original_dashboard()
+
+            s._dashboard_sync = capturing_dashboard
+
+            original_create = s._create_user_sync
+
+            def capturing_write(cmd):
+                nonlocal write_thread_id
+                write_thread_id = threading.get_ident()
+                return original_create(cmd)
+
+            s._create_user_sync = capturing_write
+
+            await asyncio.gather(
+                s.dashboard(),
+                s.apply(_create_user("r2", "bob")),
+            )
+
+            await s.close()
+            return read_thread_ids, write_thread_id
+
+        read_thread_ids, write_thread_id = asyncio.run(_run())
+
+        assert len(read_thread_ids) == 1
+        assert write_thread_id is not None
+        assert read_thread_ids[0] != write_thread_id, (
+            "read and write ran on the same thread — executors are not isolated"
+        )
