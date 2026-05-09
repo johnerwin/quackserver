@@ -144,8 +144,18 @@ Missing `request_id` returns `400`. Duplicate `request_id` within TTL returns `2
 
 ## Installation
 
+> **Note:** PyPI publishing is not yet configured — see [issue #15](https://github.com/johnerwin/quackserver/issues/15). Install from source in the meantime:
+
 ```bash
-pip install quackserver
+git clone https://github.com/johnerwin/quackserver.git
+cd quackserver
+pip install .
+```
+
+For development dependencies (pytest, httpx):
+
+```bash
+pip install ".[dev]"
 ```
 
 Requires Python 3.11+ and DuckDB 1.0+.
