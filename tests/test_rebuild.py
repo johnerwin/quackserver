@@ -89,6 +89,25 @@ class TestRebuildBasic:
         assert users == []
         assert events == []
 
+    def test_governance_commands_counted_not_unknown(self, tmp_path):
+        log = tmp_path / "quack.jsonl"
+        db = tmp_path / "quack.duckdb"
+        _write_log(log, [
+            _cmd_dict("g1", "LOG_EXPLORATORY_PASS", {
+                "metric_family": "nim_rate", "cohort": "banks_all",
+                "pass_number": 1, "script_name": "analysis.py",
+                "event_version": "1.0", "notes": None, "exp_id": None,
+            }),
+            _cmd_dict("g2", "LOG_SESSION_STARTED", {
+                "event_version": 1, "notes": None,
+            }),
+        ])
+        stats = asyncio.run(_run(log, db))
+        assert stats["log_exploratory_pass"] == 1
+        assert stats["log_session_started"] == 1
+        assert stats["unknown_command"] == 0
+        assert stats["errors"] == 0
+
     def test_unknown_command_counted_not_crashed(self, tmp_path):
         log = tmp_path / "quack.jsonl"
         db = tmp_path / "quack.duckdb"

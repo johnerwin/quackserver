@@ -37,6 +37,8 @@ async def _run(log_path: Path, db_path: Path) -> dict:
         "total": 0,
         "create_user": 0,
         "append_event": 0,
+        "log_exploratory_pass": 0,
+        "log_session_started": 0,
         "unknown_command": 0,
         "errors": 0,
     }
@@ -54,6 +56,10 @@ async def _run(log_path: Path, db_path: Path) -> dict:
                 counts["create_user"] += 1
             elif cmd.command == "append_event":
                 counts["append_event"] += 1
+            elif cmd.command == "LOG_EXPLORATORY_PASS":
+                counts["log_exploratory_pass"] += 1
+            elif cmd.command == "LOG_SESSION_STARTED":
+                counts["log_session_started"] += 1
             else:
                 counts["unknown_command"] += 1
         else:
@@ -124,6 +130,10 @@ def main(argv: list[str] | None = None) -> None:
     print(f"  entries replayed : {stats['total']}")
     print(f"  users            : {stats['create_user']}")
     print(f"  events           : {stats['append_event']}")
+    if stats["log_exploratory_pass"]:
+        print(f"  exploratory pass : {stats['log_exploratory_pass']}")
+    if stats["log_session_started"]:
+        print(f"  session started  : {stats['log_session_started']}")
     if stats["unknown_command"]:
         print(f"  unknown commands : {stats['unknown_command']}")
     if stats["errors"]:
