@@ -335,3 +335,143 @@ class TestPayloadSizeGuard:
         )
         # Content-Length header triggers the fast-path size check
         assert resp.status_code == 413
+
+
+# ---------------------------------------------------------------------------
+# Governance events — HTTP routing
+# ---------------------------------------------------------------------------
+
+
+class TestGovernanceEvents:
+    """Verify governance event_types route to semantic commands, not append_event."""
+
+    def test_log_exploratory_pass_accepted(self, client):
+        c, projection = client
+        resp = c.post(
+            "/events",
+            json={
+                "request_id": "pass-001",
+                "event_type": "LOG_EXPLORATORY_PASS",
+                "payload": {
+                    "metric_family": "nim_rate",
+                    "cohort": "banks_all",
+                    "pass_number": 1,
+                    "script_name": "analysis_nim.py",
+                    "event_version": "1.0",
+                },
+            },
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["success"] is True
+        assert body["request_id"] == "pass-001"
+
+    def test_log_session_started_accepted(self, client):
+        c, projection = client
+        resp = c.post(
+            "/events",
+            json={
+                "request_id": "sess-001",
+                "event_type": "LOG_SESSION_STARTED",
+                "payload": {"event_version": 1},
+            },
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["success"] is True
+        assert body["request_id"] == "sess-001"
+
+    def test_governance_command_dispatched_correctly(self, client):
+        """MockProjection records the command name — verify it's not 'append_event'."""
+        c, projection = client
+        c.post(
+            "/events",
+            json={
+                "request_id": "pass-cmd",
+                "event_type": "LOG_EXPLORATORY_PASS",
+                "payload": {
+                    "metric_family": "nim_rate",
+                    "cohort": "banks_all",
+                    "pass_number": 1,
+                    "script_name": "x.py",
+                },
+            },
+        )
+        # Allow worker to process
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            if projection.calls:
+                break
+            time.sleep(0.05)
+        cmd_names = [cmd for cmd, _ in projection.calls]
+        assert "LOG_EXPLORATORY_PASS" in cmd_names
+        assert "append_event" not in cmd_names
+
+    def test_non_governance_event_still_uses_append_event(self, client):
+        """page.view is not a governance type — must still route as append_event."""
+        c, projection = client
+        c.post(
+            "/events",
+            json={
+                "request_id": "ev-std",
+                "event_type": "page.view",
+                "payload": {"url": "/home"},
+            },
+        )
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            if projection.calls:
+                break
+            time.sleep(0.05)
+        cmd_names = [cmd for cmd, _ in projection.calls]
+        assert "append_event" in cmd_names
+
+    def test_governance_events_written_to_duckdb(self, tmp_path):
+        """End-to-end: governance events land in the correct DuckDB tables."""
+        import duckdb
+
+        store = DuckDBProjectionStore(tmp_path / "quack.duckdb")
+        runtime = Runtime(
+            log_path=tmp_path / "log.jsonl",
+            dedup_path=tmp_path / "dedup.db",
+            checkpoint_path=tmp_path / "checkpoint.db",
+            projection=store,
+            read_store=store,
+        )
+        app = create_app(runtime)
+        with TestClient(app) as c:
+            c.post("/events", json={
+                "request_id": "pass-e2e",
+                "event_type": "LOG_EXPLORATORY_PASS",
+                "payload": {
+                    "metric_family": "nim_rate",
+                    "cohort": "banks_all",
+                    "pass_number": 1,
+                    "script_name": "e2e_test.py",
+                    "event_version": "1.0",
+                },
+            })
+            c.post("/events", json={
+                "request_id": "sess-e2e",
+                "event_type": "LOG_SESSION_STARTED",
+                "payload": {"event_version": 1},
+            })
+            # Poll until worker has processed both
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                conn = duckdb.connect(str(tmp_path / "quack.duckdb"))
+                try:
+                    passes = conn.execute(
+                        "SELECT COUNT(*) FROM gov_exploratory_pass"
+                    ).fetchone()[0]
+                    sessions = conn.execute(
+                        "SELECT COUNT(*) FROM gov_session_log"
+                    ).fetchone()[0]
+                finally:
+                    conn.close()
+                if passes >= 1 and sessions >= 1:
+                    break
+                time.sleep(0.05)
+
+        assert passes == 1, f"expected 1 pass row, got {passes}"
+        assert sessions == 1, f"expected 1 session row, got {sessions}"

@@ -177,7 +177,7 @@ class TestDuckDBReplayInvariant:
         ).fetchone()
         conn.close()
         assert version is not None
-        assert version[0] == "1"
+        assert version[0] == "2"
 
     def test_projection_metadata_records_rebuild_provenance(self, tmp_path):
         db = tmp_path / "test.duckdb"
@@ -202,7 +202,7 @@ class TestDuckDBReplayInvariant:
             ).fetchall()
         }
         conn.close()
-        assert rows["schema_version"] == "1"
+        assert rows["schema_version"] == "2"
         assert rows["rebuilt_from_log"] == "/path/to/quack.jsonl"
         assert rows["replay_entry_count"] == "6"
         assert rows["rebuilt_at"] == "2026-05-07T12:00:00+00:00"

@@ -71,9 +71,11 @@ class InMemoryProjectionStore(ProjectionStore):
     """
 
     def __init__(self) -> None:
-        self._users: dict[str, dict] = {}  # user_id → data payload
-        self._events: list[dict] = []      # append-only event rows
-        self._applied: set[str] = set()    # request_ids successfully applied
+        self._users: dict[str, dict] = {}        # user_id → data payload
+        self._events: list[dict] = []             # append-only event rows
+        self._gov_passes: dict[str, dict] = {}    # pass_id → pass record
+        self._gov_sessions: list[dict] = []       # session records (ordered)
+        self._applied: set[str] = set()           # request_ids successfully applied
 
     # ------------------------------------------------------------------
     # ProjectionStore interface
@@ -84,6 +86,10 @@ class InMemoryProjectionStore(ProjectionStore):
             return self._create_user(command)
         if command.command == "append_event":
             return self._append_event(command)
+        if command.command == "LOG_EXPLORATORY_PASS":
+            return self._log_exploratory_pass(command)
+        if command.command == "LOG_SESSION_STARTED":
+            return self._log_session_started(command)
         return Result(
             success=False,
             status_code=400,
@@ -109,6 +115,14 @@ class InMemoryProjectionStore(ProjectionStore):
     @property
     def events(self) -> list[dict]:
         return list(self._events)
+
+    @property
+    def gov_passes(self) -> dict[str, dict]:
+        return dict(self._gov_passes)
+
+    @property
+    def gov_sessions(self) -> list[dict]:
+        return list(self._gov_sessions)
 
     @property
     def applied(self) -> frozenset[str]:
@@ -170,6 +184,79 @@ class InMemoryProjectionStore(ProjectionStore):
             "request_id": command.request_id,
             "event_type": event_type,
             "data": p.get("data", {}),
+        })
+        self._applied.add(command.request_id)
+        return Result(
+            success=True,
+            status_code=200,
+            data={"status": "accepted"},
+            request_id=command.request_id,
+        )
+
+    def _log_exploratory_pass(self, command: Command) -> Result:
+        p = command.payload
+        metric_family = p.get("metric_family")
+        cohort = p.get("cohort")
+        pass_number = p.get("pass_number")
+        script_name = p.get("script_name")
+        if not metric_family or not cohort or not script_name:
+            return Result(
+                success=False,
+                status_code=400,
+                error="LOG_EXPLORATORY_PASS: missing required field(s) "
+                      "(metric_family, cohort, script_name)",
+                request_id=command.request_id,
+                retryable=False,
+            )
+        if not isinstance(pass_number, int) or not (1 <= pass_number <= 3):
+            return Result(
+                success=False,
+                status_code=400,
+                error=f"LOG_EXPLORATORY_PASS: pass_number must be 1–3, "
+                      f"got {pass_number!r}",
+                request_id=command.request_id,
+                retryable=False,
+            )
+        # Idempotent by request_id (pass_id).
+        if command.request_id in self._applied:
+            return Result(
+                success=True,
+                status_code=200,
+                data={"status": "accepted"},
+                request_id=command.request_id,
+            )
+        self._gov_passes[command.request_id] = {
+            "pass_id": command.request_id,
+            "metric_family": metric_family,
+            "cohort": cohort,
+            "pass_number": pass_number,
+            "script_name": script_name,
+            "exp_id": p.get("exp_id"),
+            "event_version": p.get("event_version", "1.0"),
+            "notes": p.get("notes"),
+        }
+        self._applied.add(command.request_id)
+        return Result(
+            success=True,
+            status_code=200,
+            data={"status": "accepted"},
+            request_id=command.request_id,
+        )
+
+    def _log_session_started(self, command: Command) -> Result:
+        # Idempotent by request_id (session_id).
+        if command.request_id in self._applied:
+            return Result(
+                success=True,
+                status_code=200,
+                data={"status": "accepted"},
+                request_id=command.request_id,
+            )
+        p = command.payload
+        self._gov_sessions.append({
+            "session_id": command.request_id,
+            "event_version": int(p.get("event_version", 1)),
+            "notes": p.get("notes"),
         })
         self._applied.add(command.request_id)
         return Result(

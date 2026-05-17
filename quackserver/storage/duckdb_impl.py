@@ -50,7 +50,7 @@ from quackserver.storage.interface import Result
 _log = get_logger(__name__)
 
 # Increment when the schema changes so rebuilds can record what they produced.
-PROJECTION_SCHEMA_VERSION = "1"
+PROJECTION_SCHEMA_VERSION = "2"
 
 _SCHEMA_SQL = [
     """
@@ -74,6 +74,32 @@ _SCHEMA_SQL = [
         key        VARCHAR PRIMARY KEY,
         value      VARCHAR NOT NULL,
         updated_at VARCHAR NOT NULL
+    )
+    """,
+    # Governance projections — mirror dim_exploratory_pass and dim_session_log
+    # in the assay DB. Idempotent by pass_id (= request_id) so log replay never
+    # inflates the pass count. The (metric_family, cohort, pass_number) UNIQUE
+    # constraint mirrors the assay DB constraint as a defence-in-depth guard.
+    """
+    CREATE TABLE IF NOT EXISTS gov_exploratory_pass (
+        pass_id       VARCHAR PRIMARY KEY,
+        metric_family VARCHAR NOT NULL,
+        cohort        VARCHAR NOT NULL,
+        pass_number   INTEGER NOT NULL CHECK (pass_number BETWEEN 1 AND 3),
+        script_name   VARCHAR NOT NULL,
+        exp_id        VARCHAR,
+        event_version VARCHAR NOT NULL DEFAULT '1.0',
+        notes         TEXT,
+        received_at   VARCHAR NOT NULL,
+        UNIQUE (metric_family, cohort, pass_number)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS gov_session_log (
+        session_id    VARCHAR PRIMARY KEY,
+        event_version INTEGER NOT NULL DEFAULT 1,
+        notes         TEXT,
+        received_at   VARCHAR NOT NULL
     )
     """,
 ]
@@ -116,6 +142,14 @@ class DuckDBProjectionStore(ProjectionStore, ReadStore):
         if command.command == "append_event":
             return await loop.run_in_executor(
                 self._executor, self._append_event_sync, command
+            )
+        if command.command == "LOG_EXPLORATORY_PASS":
+            return await loop.run_in_executor(
+                self._executor, self._log_exploratory_pass_sync, command
+            )
+        if command.command == "LOG_SESSION_STARTED":
+            return await loop.run_in_executor(
+                self._executor, self._log_session_started_sync, command
             )
         return Result(
             success=False,
@@ -294,6 +328,133 @@ class DuckDBProjectionStore(ProjectionStore, ReadStore):
             _log.error(
                 "duckdb_error",
                 command="append_event",
+                request_id=command.request_id,
+                error=str(exc),
+            )
+            return Result(
+                success=False,
+                status_code=500,
+                error=f"storage error: {exc}",
+                request_id=command.request_id,
+                retryable=False,
+            )
+
+    def _log_exploratory_pass_sync(self, command: Command) -> Result:
+        p = command.payload
+        metric_family = p.get("metric_family")
+        cohort = p.get("cohort")
+        pass_number = p.get("pass_number")
+        script_name = p.get("script_name")
+        if not metric_family or not cohort or not script_name:
+            return Result(
+                success=False,
+                status_code=400,
+                error="LOG_EXPLORATORY_PASS: missing required field(s) "
+                      "(metric_family, cohort, script_name)",
+                request_id=command.request_id,
+                retryable=False,
+            )
+        if not isinstance(pass_number, int) or not (1 <= pass_number <= 3):
+            return Result(
+                success=False,
+                status_code=400,
+                error=f"LOG_EXPLORATORY_PASS: pass_number must be 1–3, "
+                      f"got {pass_number!r}",
+                request_id=command.request_id,
+                retryable=False,
+            )
+        try:
+            self._conn.execute(
+                """
+                INSERT INTO gov_exploratory_pass
+                    (pass_id, metric_family, cohort, pass_number, script_name,
+                     exp_id, event_version, notes, received_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT DO NOTHING
+                """,
+                [
+                    command.request_id, metric_family, cohort, pass_number,
+                    script_name, p.get("exp_id"),
+                    p.get("event_version", "1.0"), p.get("notes"),
+                    command.timestamp,
+                ],
+            )
+            return Result(
+                success=True,
+                status_code=200,
+                data={"status": "accepted"},
+                request_id=command.request_id,
+            )
+        except duckdb.IOException as exc:
+            _log.warning(
+                "duckdb_io_error",
+                command="LOG_EXPLORATORY_PASS",
+                request_id=command.request_id,
+                error=str(exc),
+            )
+            return Result(
+                success=False,
+                status_code=503,
+                error=f"transient storage error: {exc}",
+                request_id=command.request_id,
+                retryable=True,
+            )
+        except duckdb.Error as exc:
+            _log.error(
+                "duckdb_error",
+                command="LOG_EXPLORATORY_PASS",
+                request_id=command.request_id,
+                error=str(exc),
+            )
+            return Result(
+                success=False,
+                status_code=500,
+                error=f"storage error: {exc}",
+                request_id=command.request_id,
+                retryable=False,
+            )
+
+    def _log_session_started_sync(self, command: Command) -> Result:
+        p = command.payload
+        try:
+            self._conn.execute(
+                """
+                INSERT INTO gov_session_log
+                    (session_id, event_version, notes, received_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT (session_id) DO NOTHING
+                """,
+                [
+                    command.request_id,
+                    int(p.get("event_version", 1)),
+                    p.get("notes"),
+                    command.timestamp,
+                ],
+            )
+            return Result(
+                success=True,
+                status_code=200,
+                data={"status": "accepted"},
+                request_id=command.request_id,
+            )
+        except duckdb.IOException as exc:
+            _log.warning(
+                "duckdb_io_error",
+                command="LOG_SESSION_STARTED",
+                request_id=command.request_id,
+                error=str(exc),
+            )
+            return Result(
+                success=False,
+                status_code=503,
+                error=f"transient storage error: {exc}",
+                request_id=command.request_id,
+                retryable=True,
+            )
+        except duckdb.Error as exc:
+            _log.error(
+                "duckdb_error",
+                command="LOG_SESSION_STARTED",
                 request_id=command.request_id,
                 error=str(exc),
             )

@@ -44,6 +44,11 @@ router = APIRouter()
 
 _MAX_BODY_BYTES = MAX_PAYLOAD_SIZE_MB * 1024 * 1024
 
+# Governance event types receive semantic command names in the log so the JSONL
+# stream is human-readable history rather than a generic "append_event" envelope.
+# Payload is passed flat (not wrapped in {"event_type": ..., "data": ...}).
+_GOVERNANCE_EVENT_TYPES = frozenset({"LOG_EXPLORATORY_PASS", "LOG_SESSION_STARTED"})
+
 
 def _runtime(request: Request) -> Runtime:
     return request.app.state.runtime
@@ -81,12 +86,23 @@ async def _check_size(request: Request) -> None:
 @router.post("/events", response_model=WriteResponse)
 async def post_events(request: Request, body: AppendEventRequest) -> JSONResponse:
     await _check_size(request)
-    cmd = Command(
-        request_id=body.request_id,
-        command="append_event",
-        payload={"event_type": body.event_type, "data": body.payload},
-        timestamp=Command.now_utc(),
-    )
+    if body.event_type in _GOVERNANCE_EVENT_TYPES:
+        # Governance events use the event_type as the command string so the
+        # JSONL log is human-readable governance history, and the payload is
+        # the flat governance dict (not wrapped in {"event_type": ..., "data": ...}).
+        cmd = Command(
+            request_id=body.request_id,
+            command=body.event_type,
+            payload=body.payload,
+            timestamp=Command.now_utc(),
+        )
+    else:
+        cmd = Command(
+            request_id=body.request_id,
+            command="append_event",
+            payload={"event_type": body.event_type, "data": body.payload},
+            timestamp=Command.now_utc(),
+        )
     result = await _runtime(request).enqueue(cmd)
     return _result_to_response(result)
 

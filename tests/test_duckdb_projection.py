@@ -54,6 +54,41 @@ def _append_event(request_id: str, event_type: str, data: dict | None = None) ->
     )
 
 
+def _exploratory_pass(
+    request_id: str,
+    metric_family: str = "nim_rate",
+    cohort: str = "banks_all",
+    pass_number: int = 1,
+    script_name: str = "analysis.py",
+    exp_id: str | None = None,
+    notes: str | None = None,
+) -> Command:
+    return _cmd(
+        request_id,
+        "LOG_EXPLORATORY_PASS",
+        {
+            "metric_family": metric_family,
+            "cohort": cohort,
+            "pass_number": pass_number,
+            "script_name": script_name,
+            "exp_id": exp_id,
+            "event_version": "1.0",
+            "notes": notes,
+        },
+    )
+
+
+def _session_started(
+    request_id: str,
+    notes: str | None = None,
+) -> Command:
+    return _cmd(
+        request_id,
+        "LOG_SESSION_STARTED",
+        {"event_version": 1, "notes": notes},
+    )
+
+
 def _store(tmp_path: Path) -> DuckDBProjectionStore:
     return DuckDBProjectionStore(tmp_path / "test.duckdb")
 
@@ -504,3 +539,279 @@ class TestReadWriteIsolation:
         assert read_thread_ids[0] != write_thread_id, (
             "read and write ran on the same thread — executors are not isolated"
         )
+
+
+# ---------------------------------------------------------------------------
+# LOG_EXPLORATORY_PASS
+# ---------------------------------------------------------------------------
+
+
+class TestLogExploratoryPass:
+    def test_returns_success(self, tmp_path):
+        async def _run():
+            s = _store(tmp_path)
+            r = await s.apply(_exploratory_pass("r1"))
+            await s.close()
+            return r
+
+        r = asyncio.run(_run())
+        assert r.success is True
+        assert r.status_code == 200
+        assert r.request_id == "r1"
+        assert r.data == {"status": "accepted"}
+
+    def test_inserts_row(self, tmp_path):
+        async def _run():
+            s = _store(tmp_path)
+            await s.apply(_exploratory_pass(
+                "r1", metric_family="nim_rate", cohort="banks_all",
+                pass_number=2, script_name="nim_pass2.py", notes="second pass",
+            ))
+            await s.close()
+
+        asyncio.run(_run())
+        rows = _read_rows(tmp_path / "test.duckdb", "gov_exploratory_pass")
+        assert len(rows) == 1
+        assert rows[0]["pass_id"] == "r1"
+        assert rows[0]["metric_family"] == "nim_rate"
+        assert rows[0]["cohort"] == "banks_all"
+        assert rows[0]["pass_number"] == 2
+        assert rows[0]["script_name"] == "nim_pass2.py"
+        assert rows[0]["notes"] == "second pass"
+        assert rows[0]["event_version"] == "1.0"
+
+    def test_idempotent_by_request_id(self, tmp_path):
+        """Replaying the same command does not create a duplicate row."""
+        async def _run():
+            s = _store(tmp_path)
+            r1 = await s.apply(_exploratory_pass("r1"))
+            r2 = await s.apply(_exploratory_pass("r1"))
+            await s.close()
+            return r1, r2
+
+        r1, r2 = asyncio.run(_run())
+        assert r1.success is True
+        assert r2.success is True
+        rows = _read_rows(tmp_path / "test.duckdb", "gov_exploratory_pass")
+        assert len(rows) == 1
+
+    def test_unique_slot_constraint(self, tmp_path):
+        """Different request_ids for the same (family, cohort, pass) → second is ignored."""
+        async def _run():
+            s = _store(tmp_path)
+            r1 = await s.apply(_exploratory_pass("r1", pass_number=1))
+            r2 = await s.apply(_exploratory_pass("r2", pass_number=1))
+            await s.close()
+            return r1, r2
+
+        r1, r2 = asyncio.run(_run())
+        assert r1.success is True
+        assert r2.success is True  # ON CONFLICT DO NOTHING → success, no duplicate
+        rows = _read_rows(tmp_path / "test.duckdb", "gov_exploratory_pass")
+        assert len(rows) == 1  # only the first pass inserted
+
+    def test_three_passes_all_stored(self, tmp_path):
+        async def _run():
+            s = _store(tmp_path)
+            for n in (1, 2, 3):
+                await s.apply(_exploratory_pass(f"r{n}", pass_number=n))
+            await s.close()
+
+        asyncio.run(_run())
+        rows = _read_rows(tmp_path / "test.duckdb", "gov_exploratory_pass")
+        assert len(rows) == 3
+        assert {r["pass_number"] for r in rows} == {1, 2, 3}
+
+    def test_missing_metric_family_returns_400(self, tmp_path):
+        async def _run():
+            s = _store(tmp_path)
+            r = await s.apply(_cmd("r1", "LOG_EXPLORATORY_PASS", {
+                "cohort": "banks_all", "pass_number": 1, "script_name": "x.py",
+            }))
+            await s.close()
+            return r
+
+        r = asyncio.run(_run())
+        assert r.success is False
+        assert r.status_code == 400
+        assert r.retryable is False
+
+    def test_missing_cohort_returns_400(self, tmp_path):
+        async def _run():
+            s = _store(tmp_path)
+            r = await s.apply(_cmd("r1", "LOG_EXPLORATORY_PASS", {
+                "metric_family": "nim_rate", "pass_number": 1, "script_name": "x.py",
+            }))
+            await s.close()
+            return r
+
+        r = asyncio.run(_run())
+        assert r.success is False
+        assert r.status_code == 400
+        assert r.retryable is False
+
+    def test_invalid_pass_number_zero_returns_400(self, tmp_path):
+        async def _run():
+            s = _store(tmp_path)
+            r = await s.apply(_exploratory_pass("r1", pass_number=0))
+            await s.close()
+            return r
+
+        r = asyncio.run(_run())
+        assert r.success is False
+        assert r.status_code == 400
+        assert r.retryable is False
+
+    def test_invalid_pass_number_four_returns_400(self, tmp_path):
+        async def _run():
+            s = _store(tmp_path)
+            r = await s.apply(_exploratory_pass("r1", pass_number=4))
+            await s.close()
+            return r
+
+        r = asyncio.run(_run())
+        assert r.success is False
+        assert r.status_code == 400
+        assert r.retryable is False
+
+    def test_survives_reopen(self, tmp_path):
+        db_path = tmp_path / "test.duckdb"
+
+        async def _write():
+            s = DuckDBProjectionStore(db_path)
+            await s.apply(_exploratory_pass("r1", pass_number=1))
+            await s.close()
+
+        asyncio.run(_write())
+        rows = _read_rows(db_path, "gov_exploratory_pass")
+        assert len(rows) == 1
+        assert rows[0]["pass_id"] == "r1"
+
+    def test_replay_does_not_duplicate(self, tmp_path):
+        """Log replay idempotency: applying the same pass_id twice gives one row."""
+        db_path = tmp_path / "test.duckdb"
+
+        async def _write():
+            s = DuckDBProjectionStore(db_path)
+            await s.apply(_exploratory_pass("r1"))
+            await s.close()
+
+        async def _replay():
+            s = DuckDBProjectionStore(db_path)
+            r = await s.apply(_exploratory_pass("r1"))
+            await s.close()
+            return r
+
+        asyncio.run(_write())
+        r = asyncio.run(_replay())
+        assert r.success is True
+        rows = _read_rows(db_path, "gov_exploratory_pass")
+        assert len(rows) == 1
+
+
+# ---------------------------------------------------------------------------
+# LOG_SESSION_STARTED
+# ---------------------------------------------------------------------------
+
+
+class TestLogSessionStarted:
+    def test_returns_success(self, tmp_path):
+        async def _run():
+            s = _store(tmp_path)
+            r = await s.apply(_session_started("s1"))
+            await s.close()
+            return r
+
+        r = asyncio.run(_run())
+        assert r.success is True
+        assert r.status_code == 200
+        assert r.request_id == "s1"
+        assert r.data == {"status": "accepted"}
+
+    def test_inserts_row(self, tmp_path):
+        async def _run():
+            s = _store(tmp_path)
+            await s.apply(_session_started("s1", notes="morning session"))
+            await s.close()
+
+        asyncio.run(_run())
+        rows = _read_rows(tmp_path / "test.duckdb", "gov_session_log")
+        assert len(rows) == 1
+        assert rows[0]["session_id"] == "s1"
+        assert rows[0]["notes"] == "morning session"
+        assert rows[0]["event_version"] == 1
+
+    def test_idempotent_by_session_id(self, tmp_path):
+        """Replaying the same session_id does not create a duplicate row."""
+        async def _run():
+            s = _store(tmp_path)
+            r1 = await s.apply(_session_started("s1"))
+            r2 = await s.apply(_session_started("s1"))
+            await s.close()
+            return r1, r2
+
+        r1, r2 = asyncio.run(_run())
+        assert r1.success is True
+        assert r2.success is True
+        rows = _read_rows(tmp_path / "test.duckdb", "gov_session_log")
+        assert len(rows) == 1
+
+    def test_multiple_sessions_all_stored(self, tmp_path):
+        """Each session start produces a distinct row — no dedup across sessions."""
+        async def _run():
+            s = _store(tmp_path)
+            for sid in ("s1", "s2", "s3"):
+                await s.apply(_session_started(sid))
+            await s.close()
+
+        asyncio.run(_run())
+        rows = _read_rows(tmp_path / "test.duckdb", "gov_session_log")
+        assert len(rows) == 3
+        assert {r["session_id"] for r in rows} == {"s1", "s2", "s3"}
+
+    def test_ordered_by_received_at(self, tmp_path):
+        """Rows must be ordered by received_at so OFFSET 1 gives the prior session."""
+        async def _run():
+            s = _store(tmp_path)
+            await s.apply(_session_started("s1"))
+            await s.apply(_session_started("s2"))
+            await s.apply(_session_started("s3"))
+            await s.close()
+
+        asyncio.run(_run())
+        rows = _read_rows(tmp_path / "test.duckdb", "gov_session_log")
+        received_ats = [r["received_at"] for r in rows]
+        assert received_ats == sorted(received_ats)
+
+    def test_survives_reopen(self, tmp_path):
+        db_path = tmp_path / "test.duckdb"
+
+        async def _write():
+            s = DuckDBProjectionStore(db_path)
+            await s.apply(_session_started("s1"))
+            await s.close()
+
+        asyncio.run(_write())
+        rows = _read_rows(db_path, "gov_session_log")
+        assert len(rows) == 1
+        assert rows[0]["session_id"] == "s1"
+
+    def test_replay_does_not_duplicate(self, tmp_path):
+        db_path = tmp_path / "test.duckdb"
+
+        async def _write():
+            s = DuckDBProjectionStore(db_path)
+            await s.apply(_session_started("s1"))
+            await s.close()
+
+        async def _replay():
+            s = DuckDBProjectionStore(db_path)
+            r = await s.apply(_session_started("s1"))
+            await s.close()
+            return r
+
+        asyncio.run(_write())
+        r = asyncio.run(_replay())
+        assert r.success is True
+        rows = _read_rows(db_path, "gov_session_log")
+        assert len(rows) == 1
