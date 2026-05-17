@@ -815,3 +815,18 @@ class TestLogSessionStarted:
         assert r.success is True
         rows = _read_rows(db_path, "gov_session_log")
         assert len(rows) == 1
+
+    def test_event_version_as_string_float(self, tmp_path):
+        """assay governance.py sends event_version='1.0' (string) — must not crash."""
+        async def _run():
+            s = _store(tmp_path)
+            r = await s.apply(_cmd("s1", "LOG_SESSION_STARTED",
+                                   {"event_version": "1.0", "notes": None}))
+            await s.close()
+            return r
+
+        r = asyncio.run(_run())
+        assert r.success is True
+        rows = _read_rows(tmp_path / "test.duckdb", "gov_session_log")
+        assert len(rows) == 1
+        assert rows[0]["event_version"] == 1

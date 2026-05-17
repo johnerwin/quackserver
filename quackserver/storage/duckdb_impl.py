@@ -426,7 +426,7 @@ class DuckDBProjectionStore(ProjectionStore, ReadStore):
                 """,
                 [
                     command.request_id,
-                    int(p.get("event_version", 1)),
+                    int(float(p.get("event_version", 1))),
                     p.get("notes"),
                     command.timestamp,
                 ],

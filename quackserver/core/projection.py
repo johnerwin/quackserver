@@ -255,7 +255,7 @@ class InMemoryProjectionStore(ProjectionStore):
         p = command.payload
         self._gov_sessions.append({
             "session_id": command.request_id,
-            "event_version": int(p.get("event_version", 1)),
+            "event_version": int(float(p.get("event_version", 1))),
             "notes": p.get("notes"),
         })
         self._applied.add(command.request_id)
