@@ -62,6 +62,22 @@ def view_definitions(conn) -> dict[str, str]:
     return {name: (defn or "") for name, defn in rows if name in user_views}
 
 
+def sequence_ddls(conn) -> list[str]:
+    """CREATE SEQUENCE statements for every sequence in 'main', current-value preserved.
+
+    duckdb_sequences().sql reflects the live counter position (via START), not the
+    original creation-time start value — recreating from this keeps nextval()
+    continuity so post-copy inserts don't collide with copied data.
+    """
+    return [
+        r[0]
+        for r in conn.execute(
+            "SELECT sql FROM duckdb_sequences() WHERE schema_name='main' "
+            "ORDER BY sequence_name"
+        ).fetchall()
+    ]
+
+
 def estimated_sizes(conn) -> dict[str, int]:
     try:
         rows = conn.execute(

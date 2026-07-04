@@ -66,6 +66,7 @@ from quackserver.cli._duckdb_helpers import (
     estimated_sizes,
     fmt_size,
     row_count,
+    sequence_ddls,
     settings_snapshot,
     table_hash,
     topo_sort_views,
@@ -90,6 +91,7 @@ def _probe(conn, source_path: Path) -> dict:
     sigs = col_signatures(conn)
     est = estimated_sizes(conn)
     vdefs = view_definitions(conn)
+    seqs = sequence_ddls(conn)
 
     counts: dict[str, int] = {}
     for t in tables:
@@ -100,6 +102,7 @@ def _probe(conn, source_path: Path) -> dict:
 
     print(f"  Tables        : {len(tables)}")
     print(f"  Views         : {len(views)}")
+    print(f"  Sequences     : {len(seqs)}")
     print(f"  Total rows    : {total_rows:,}")
     print(f"  Estimated live: {fmt_size(total_est)}")
     print(f"  File on disk  : {fmt_size(source_path.stat().st_size)}")
@@ -137,6 +140,7 @@ def _probe(conn, source_path: Path) -> dict:
         "sigs": sigs,
         "counts": counts,
         "vdefs": vdefs,
+        "seqs": seqs,
     }
 
 
@@ -182,9 +186,15 @@ def _copy_schema(src_conn, output_path: Path, probe_data: dict) -> None:
     print("\n-- Phase 3: Schema copy --------------------------------------------")
     tables = probe_data["tables"]
     vdefs = probe_data["vdefs"]
+    seqs = probe_data["seqs"]
 
     # Use a single setup connection for DDL - no data yet
     with duckdb.connect(str(output_path)) as setup:
+        if seqs:
+            print(f"  Creating {len(seqs)} sequences (current-value preserved)...")
+            for ddl in seqs:
+                setup.execute(ddl)
+
         print(f"  Creating {len(tables)} tables...")
         for t in tables:
             ddl = build_create_table_ddl(src_conn, t)
